@@ -84,6 +84,15 @@ apt-get install -y --no-install-recommends \
     libglu1-mesa
 systemctl enable docker.service
 
+# trivy: aquasecurity/trivy-action's setup step does not reliably deliver
+# the binary into PATH on self-hosted runners ("trivy: command not found");
+# baking it also skips a per-job download (nothing survives the recycle).
+log "installing trivy"
+TRIVY_VER=$(curl -fsSL https://api.github.com/repos/aquasecurity/trivy/releases/latest | jq -r '.tag_name | ltrimstr("v")')
+curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VER}/trivy_${TRIVY_VER}_Linux-64bit.tar.gz" \
+    | tar -xz -C /usr/local/bin trivy
+trivy --version
+
 # -----------------------------------------------------------------------------
 # Runner user.
 # -----------------------------------------------------------------------------
