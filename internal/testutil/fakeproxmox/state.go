@@ -28,6 +28,28 @@ type vmRecord struct {
 	Snapshots       []string
 	SnapshotCreates int
 	Rollbacks       int
+
+	// FirewallRules / FirewallOptions record what the orchestrator
+	// applied via POST .../firewall/rules and PUT .../firewall/options.
+	// Mirrors real PVE: this state is per-VM and (like the real
+	// /etc/pve/firewall/<vmid>.fw file) is NOT copied on clone.
+	FirewallRules   []FirewallRuleRecord
+	FirewallOptions map[string]any
+
+	// FirewallActiveAtFirstStart captures whether the VM firewall was
+	// enabled (options enable=1 with at least one rule) at the moment
+	// of the VM's FIRST qmstart. Tests assert on it to pin the
+	// "sandbox before first boot" ordering contract. Meaningless until
+	// EverStarted is true.
+	EverStarted                bool
+	FirewallActiveAtFirstStart bool
+}
+
+// FirewallRuleRecord is one recorded firewall rule in wire-field form.
+type FirewallRuleRecord struct {
+	Type   string
+	Action string
+	Enable int
 }
 
 // taskRecord backs the asynchronous task model. Real Proxmox returns an
@@ -63,15 +85,26 @@ func (s *store) snapshot() []VMSnapshot {
 	defer s.mu.Unlock()
 	out := make([]VMSnapshot, 0, len(s.vms))
 	for _, v := range s.vms {
+		var fwOpts map[string]any
+		if v.FirewallOptions != nil {
+			fwOpts = make(map[string]any, len(v.FirewallOptions))
+			for k, val := range v.FirewallOptions {
+				fwOpts[k] = val
+			}
+		}
 		out = append(out, VMSnapshot{
-			VMID:            v.VMID,
-			Node:            v.Node,
-			Name:            v.Name,
-			Tags:            v.Tags,
-			Running:         v.Running,
-			Snapshots:       append([]string(nil), v.Snapshots...),
-			SnapshotCreates: v.SnapshotCreates,
-			Rollbacks:       v.Rollbacks,
+			VMID:                       v.VMID,
+			Node:                       v.Node,
+			Name:                       v.Name,
+			Tags:                       v.Tags,
+			Running:                    v.Running,
+			Snapshots:                  append([]string(nil), v.Snapshots...),
+			SnapshotCreates:            v.SnapshotCreates,
+			Rollbacks:                  v.Rollbacks,
+			FirewallRules:              append([]FirewallRuleRecord(nil), v.FirewallRules...),
+			FirewallOptions:            fwOpts,
+			EverStarted:                v.EverStarted,
+			FirewallActiveAtFirstStart: v.FirewallActiveAtFirstStart,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].VMID < out[j].VMID })
@@ -91,6 +124,13 @@ type VMSnapshot struct {
 	Snapshots       []string
 	SnapshotCreates int
 	Rollbacks       int
+
+	// Firewall state as applied via the per-VM firewall endpoints.
+	// FirewallActiveAtFirstStart is only meaningful when EverStarted.
+	FirewallRules              []FirewallRuleRecord
+	FirewallOptions            map[string]any
+	EverStarted                bool
+	FirewallActiveAtFirstStart bool
 }
 
 // seedVM inserts a VM directly into the store, bypassing the API. Tests

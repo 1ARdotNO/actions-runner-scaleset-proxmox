@@ -177,6 +177,10 @@ func (s *Server) routes() http.Handler {
 	r.Post("/nodes/{node}/qemu/{vmid}/status/start", s.handleStart)
 	r.Post("/nodes/{node}/qemu/{vmid}/status/stop", s.handleStop)
 	r.Post("/nodes/{node}/qemu/{vmid}/status/shutdown", s.handleShutdown)
+	// Per-VM firewall endpoints. Both are synchronous on real PVE (no
+	// UPID task) — the response is a bare {"data": null}.
+	r.Post("/nodes/{node}/qemu/{vmid}/firewall/rules", s.handleFirewallRuleCreate)
+	r.Put("/nodes/{node}/qemu/{vmid}/firewall/options", s.handleFirewallOptionsSet)
 	r.Post("/nodes/{node}/qemu/{vmid}/snapshot", s.handleSnapshotCreate)
 	r.Get("/nodes/{node}/qemu/{vmid}/snapshot", s.handleSnapshotList)
 	r.Post("/nodes/{node}/qemu/{vmid}/snapshot/{snapname}/rollback", s.handleSnapshotRollback)
@@ -451,8 +455,36 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 	v.Running = true
 	v.StartedAt = time.Now()
+	if !v.EverStarted {
+		// Freeze the firewall state observed at the VM's first-ever
+		// start: the orchestrator's contract is "sandbox active before
+		// first boot", and tests assert on this bit to catch an
+		// apply-after-start ordering regression.
+		v.EverStarted = true
+		enabled := false
+		if v.FirewallOptions != nil {
+			enabled = jsonNumEquals(v.FirewallOptions["enable"], 1)
+		}
+		v.FirewallActiveAtFirstStart = enabled && len(v.FirewallRules) > 0
+	}
 	task := s.store.newTaskLocked(v.Node, "qmstart", fmt.Sprintf("%d", vmid))
 	writeData(w, task.UPID)
+}
+
+// jsonNumEquals compares a decoded-JSON value (float64 / int / bool
+// per encoding/json) against an int, tolerating the 1-vs-true shapes
+// clients use for PVE boolean flags.
+func jsonNumEquals(v any, want int) bool {
+	switch n := v.(type) {
+	case float64:
+		return int(n) == want
+	case int:
+		return n == want
+	case bool:
+		return n == (want != 0)
+	default:
+		return false
+	}
 }
 
 func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
@@ -481,6 +513,89 @@ func (s *Server) stopLike(w http.ResponseWriter, r *http.Request, kind string) {
 	v.Running = false
 	task := s.store.newTaskLocked(v.Node, kind, fmt.Sprintf("%d", vmid))
 	writeData(w, task.UPID)
+}
+
+// handleFirewallRuleCreate models
+// POST /nodes/{node}/qemu/{vmid}/firewall/rules. Synchronous on real
+// PVE — no task is returned; the rule takes effect immediately. The
+// recorded rule fields are exposed via Snapshot for assertions.
+func (s *Server) handleFirewallRuleCreate(w http.ResponseWriter, r *http.Request) {
+	vmid, err := vmidParam(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad vmid")
+		return
+	}
+	var body struct {
+		Type   string `json:"type"`
+		Action string `json:"action"`
+		Enable int    `json:"enable"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "bad firewall rule body: "+err.Error())
+		return
+	}
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	if _, ok := s.store.matchFaultLocked(FaultFirewallFail, vmid); ok {
+		writeError(w, http.StatusInternalServerError,
+			fmt.Sprintf("firewall rule create failed for VM %d (injected: FaultFirewallFail)", vmid))
+		return
+	}
+	v, ok := s.store.findVMLocked(vmid)
+	if !ok {
+		writeError(w, http.StatusInternalServerError,
+			fmt.Sprintf("Configuration file 'nodes/%s/qemu-server/%d.conf' does not exist",
+				chi.URLParam(r, "node"), vmid))
+		return
+	}
+	if body.Type == "" || body.Action == "" {
+		writeError(w, http.StatusBadRequest, "type and action are required")
+		return
+	}
+	v.FirewallRules = append(v.FirewallRules, FirewallRuleRecord{
+		Type:   body.Type,
+		Action: body.Action,
+		Enable: body.Enable,
+	})
+	writeData(w, nil)
+}
+
+// handleFirewallOptionsSet models
+// PUT /nodes/{node}/qemu/{vmid}/firewall/options. Synchronous like the
+// rules endpoint. The full decoded body is stored so tests can assert
+// on enable / dhcp exactly as sent on the wire.
+func (s *Server) handleFirewallOptionsSet(w http.ResponseWriter, r *http.Request) {
+	vmid, err := vmidParam(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad vmid")
+		return
+	}
+	var body map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "bad firewall options body: "+err.Error())
+		return
+	}
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	if _, ok := s.store.matchFaultLocked(FaultFirewallFail, vmid); ok {
+		writeError(w, http.StatusInternalServerError,
+			fmt.Sprintf("firewall options set failed for VM %d (injected: FaultFirewallFail)", vmid))
+		return
+	}
+	v, ok := s.store.findVMLocked(vmid)
+	if !ok {
+		writeError(w, http.StatusInternalServerError,
+			fmt.Sprintf("Configuration file 'nodes/%s/qemu-server/%d.conf' does not exist",
+				chi.URLParam(r, "node"), vmid))
+		return
+	}
+	if v.FirewallOptions == nil {
+		v.FirewallOptions = map[string]any{}
+	}
+	for k, val := range body {
+		v.FirewallOptions[k] = val
+	}
+	writeData(w, nil)
 }
 
 // handleSnapshotCreate models POST /nodes/{node}/qemu/{vmid}/snapshot.
