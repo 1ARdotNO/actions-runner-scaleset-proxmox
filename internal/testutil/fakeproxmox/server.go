@@ -195,10 +195,14 @@ func (s *Server) routes() http.Handler {
 	r.Post("/nodes/{node}/qemu/{vmid}/status/start", s.handleStart)
 	r.Post("/nodes/{node}/qemu/{vmid}/status/stop", s.handleStop)
 	r.Post("/nodes/{node}/qemu/{vmid}/status/shutdown", s.handleShutdown)
-	// Per-VM firewall endpoints. Both are synchronous on real PVE (no
-	// UPID task) — the response is a bare {"data": null}.
+	// Per-VM firewall endpoints. The mutating pair is synchronous on
+	// real PVE (no UPID task) — the response is a bare {"data": null}.
+	// The GET pair backs the provisioner's ensureFirewall pre-start
+	// verification.
 	r.Post("/nodes/{node}/qemu/{vmid}/firewall/rules", s.handleFirewallRuleCreate)
+	r.Get("/nodes/{node}/qemu/{vmid}/firewall/rules", s.handleFirewallRulesList)
 	r.Put("/nodes/{node}/qemu/{vmid}/firewall/options", s.handleFirewallOptionsSet)
+	r.Get("/nodes/{node}/qemu/{vmid}/firewall/options", s.handleFirewallOptionsGet)
 	r.Post("/nodes/{node}/qemu/{vmid}/snapshot", s.handleSnapshotCreate)
 	r.Get("/nodes/{node}/qemu/{vmid}/snapshot", s.handleSnapshotList)
 	r.Post("/nodes/{node}/qemu/{vmid}/snapshot/{snapname}/rollback", s.handleSnapshotRollback)
@@ -576,6 +580,75 @@ func (s *Server) handleFirewallRuleCreate(w http.ResponseWriter, r *http.Request
 		Enable: body.Enable,
 	})
 	writeData(w, nil)
+}
+
+// handleFirewallRulesList models
+// GET /nodes/{node}/qemu/{vmid}/firewall/rules. Real PVE returns the
+// rule list with positional indexes; go-proxmox decodes it into
+// []*FirewallRule. Honors FaultFirewallFail so tests can model a
+// firewall API that is broken for reads as well as writes.
+func (s *Server) handleFirewallRulesList(w http.ResponseWriter, r *http.Request) {
+	vmid, err := vmidParam(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad vmid")
+		return
+	}
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	if _, ok := s.store.matchFaultLocked(FaultFirewallFail, vmid); ok {
+		writeError(w, http.StatusInternalServerError,
+			fmt.Sprintf("firewall rules list failed for VM %d (injected: FaultFirewallFail)", vmid))
+		return
+	}
+	v, ok := s.store.findVMLocked(vmid)
+	if !ok {
+		writeError(w, http.StatusInternalServerError,
+			fmt.Sprintf("Configuration file 'nodes/%s/qemu-server/%d.conf' does not exist",
+				chi.URLParam(r, "node"), vmid))
+		return
+	}
+	out := make([]map[string]any, 0, len(v.FirewallRules))
+	for i, rule := range v.FirewallRules {
+		out = append(out, map[string]any{
+			"pos":    i,
+			"type":   rule.Type,
+			"action": rule.Action,
+			"enable": rule.Enable,
+		})
+	}
+	writeData(w, out)
+}
+
+// handleFirewallOptionsGet models
+// GET /nodes/{node}/qemu/{vmid}/firewall/options. A VM that never had
+// options set returns an empty object (real PVE returns the defaults;
+// enable absent decodes as false, which is the same signal). Honors
+// FaultFirewallFail like the other firewall routes.
+func (s *Server) handleFirewallOptionsGet(w http.ResponseWriter, r *http.Request) {
+	vmid, err := vmidParam(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad vmid")
+		return
+	}
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	if _, ok := s.store.matchFaultLocked(FaultFirewallFail, vmid); ok {
+		writeError(w, http.StatusInternalServerError,
+			fmt.Sprintf("firewall options get failed for VM %d (injected: FaultFirewallFail)", vmid))
+		return
+	}
+	v, ok := s.store.findVMLocked(vmid)
+	if !ok {
+		writeError(w, http.StatusInternalServerError,
+			fmt.Sprintf("Configuration file 'nodes/%s/qemu-server/%d.conf' does not exist",
+				chi.URLParam(r, "node"), vmid))
+		return
+	}
+	opts := v.FirewallOptions
+	if opts == nil {
+		opts = map[string]any{}
+	}
+	writeData(w, opts)
 }
 
 // handleFirewallOptionsSet models

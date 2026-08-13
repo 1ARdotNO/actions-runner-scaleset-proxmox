@@ -288,3 +288,104 @@ func TestClone_FirewallDisabledLeavesTemplateNICsAlone(t *testing.T) {
 	got := findVM(t, fp, vm.VMID)
 	require.Equal(t, "virtio=AA:BB:CC:DD:EE:F0,bridge=vmbr0", got.Config["net0"])
 }
+
+// ---------------------------------------------------------------------------
+// Pre-start firewall enforcement (ensureFirewall)
+// ---------------------------------------------------------------------------
+//
+// Clone sandboxes fresh VMs, but a VM can reach Start without ever
+// passing through this process's applyFirewall: crash-recovery
+// adoption of a clone that died between the qmclone task and
+// applyFirewall (the pool adopts the stopped VM as Warm and later
+// boots it), or a pre-feature fleet adopted after the operator enables
+// proxmox.firewall. Start must apply the missing sandbox or fail —
+// never boot unfiltered.
+
+// TestStart_FirewallEnsuredOnAdoptedVM: a seeded (adopted) VM with no
+// firewall state and a flag-less NIC gets the full sandbox — rule,
+// options, NIC flag — applied before its first boot.
+func TestStart_FirewallEnsuredOnAdoptedVM(t *testing.T) {
+	t.Parallel()
+	fp := fakeproxmox.New(t, fakeproxmox.Options{})
+	fp.SeedVM("pve1", 10060, "gh-runner-test-10060", false, []string{"gh-scaleset"})
+	require.NoError(t, fp.SetVMConfig(10060, "net0", "virtio=AA:BB:CC:DD:EE:60,bridge=vmbr0"))
+	p := newFirewallProvisioner(t, fp, config.FirewallConfig{
+		Enabled:       true,
+		SecurityGroup: "gh-runner",
+	})
+
+	require.NoError(t, p.Start(context.Background(), &VM{VMID: 10060, Node: "pve1"}))
+
+	got := findVM(t, fp, 10060)
+	require.Equal(t, []fakeproxmox.FirewallRuleRecord{
+		{Type: "group", Action: "gh-runner", Enable: 1},
+	}, got.FirewallRules)
+	require.EqualValues(t, 1, got.FirewallOptions["enable"])
+	require.EqualValues(t, 1, got.FirewallOptions["dhcp"])
+	require.Equal(t, "virtio=AA:BB:CC:DD:EE:60,bridge=vmbr0,firewall=1", got.Config["net0"],
+		"adopted VM's NIC must be attached to the firewall bridge too")
+	require.True(t, got.Running)
+	require.True(t, got.FirewallActiveAtFirstStart,
+		"the sandbox must land before the adopted VM's first boot")
+}
+
+// TestStart_FirewallAlreadySandboxedIsIdempotent: a VM that Clone
+// already sandboxed must not accumulate duplicate group rules across
+// starts (warm->hot promotion, recycle restarts).
+func TestStart_FirewallAlreadySandboxedIsIdempotent(t *testing.T) {
+	t.Parallel()
+	fp := fakeproxmox.New(t, fakeproxmox.Options{})
+	p := newFirewallProvisioner(t, fp, config.FirewallConfig{
+		Enabled:       true,
+		SecurityGroup: "gh-runner",
+	})
+
+	vm, err := p.Clone(context.Background(), CloneOptions{
+		NewVMID: 10061, Node: "pve1", Name: "gh-runner-test-10061",
+	})
+	require.NoError(t, err)
+	require.NoError(t, p.Start(context.Background(), &VM{VMID: vm.VMID, Node: vm.Node}))
+
+	got := findVM(t, fp, vm.VMID)
+	require.Len(t, got.FirewallRules, 1, "re-verification must not stack duplicate group rules")
+	require.True(t, got.Running)
+	require.True(t, got.FirewallActiveAtFirstStart)
+}
+
+// TestStart_FirewallFailureBlocksBoot: when the firewall API is broken
+// Start must FAIL and the VM must never power on — the fail-safe
+// direction is "no boot", not "boot unsandboxed".
+func TestStart_FirewallFailureBlocksBoot(t *testing.T) {
+	t.Parallel()
+	fp := fakeproxmox.New(t, fakeproxmox.Options{})
+	fp.SeedVM("pve1", 10062, "gh-runner-test-10062", false, []string{"gh-scaleset"})
+	fp.InjectFault(fakeproxmox.Fault{Kind: fakeproxmox.FaultFirewallFail})
+	p := newFirewallProvisioner(t, fp, config.FirewallConfig{
+		Enabled:       true,
+		SecurityGroup: "gh-runner",
+	})
+
+	err := p.Start(context.Background(), &VM{VMID: 10062, Node: "pve1"})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "ensure firewall before start")
+
+	got := findVM(t, fp, 10062)
+	require.False(t, got.Running)
+	require.False(t, got.EverStarted)
+}
+
+// TestStart_FirewallDisabledMakesNoFirewallCalls: with the feature off
+// Start stays byte-for-byte the pre-feature path.
+func TestStart_FirewallDisabledMakesNoFirewallCalls(t *testing.T) {
+	t.Parallel()
+	fp := fakeproxmox.New(t, fakeproxmox.Options{})
+	fp.SeedVM("pve1", 10063, "gh-runner-test-10063", false, []string{"gh-scaleset"})
+	p := newTestProvisioner(t, fp.Server, "pve1")
+
+	require.NoError(t, p.Start(context.Background(), &VM{VMID: 10063, Node: "pve1"}))
+
+	got := findVM(t, fp, 10063)
+	require.Empty(t, got.FirewallRules)
+	require.Nil(t, got.FirewallOptions)
+	require.True(t, got.Running)
+}

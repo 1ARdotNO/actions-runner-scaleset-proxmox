@@ -56,11 +56,12 @@ const (
 	FaultTagApplyDelay
 
 	// FaultFirewallFail makes the per-VM firewall endpoints
-	// (POST firewall/rules, PUT firewall/options) return 500 for the
-	// matched VMID. Sticky (not count-consumed). Used to verify the
-	// provisioner FAILS the clone when the sandbox can't be applied —
-	// a runner that was supposed to be firewalled must never start
-	// unfiltered.
+	// (GET/POST firewall/rules, GET/PUT firewall/options) return 500
+	// for the matched VMID. Sticky (not count-consumed). Used to
+	// verify the provisioner FAILS the clone — and Start's
+	// ensureFirewall pre-boot verification — when the sandbox can't
+	// be applied: a runner that was supposed to be firewalled must
+	// never start unfiltered.
 	FaultFirewallFail
 
 	// FaultJITInjectFail makes every agent/file-write call return 500

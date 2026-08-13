@@ -774,12 +774,88 @@ func (p *pmox) locateTemplate(ctx context.Context, templateVMID int) (string, er
 // Start powers on an existing VM and waits up to 5 minutes for the task to
 // settle. The VM may not yet have a working guest agent on return; call
 // WaitReady to confirm.
+//
+// When proxmox.firewall is enabled, Start re-verifies the sandbox
+// before powering on and fails rather than boot an unsandboxed VM.
+// Clone covers freshly created VMs, but VMs can reach Start without
+// ever having passed through this process's applyFirewall:
+//
+//   - crash-recovery adoption of a VM whose clone died between the
+//     qmclone task completing and applyFirewall (the pool adopts a
+//     stopped owner-tagged — or even untagged in-range — VM as Warm
+//     and later boots it via this method), and
+//   - a pre-feature fleet adopted after the operator turns
+//     proxmox.firewall on.
+//
+// ensureFirewall is idempotent, so the common case (VM already
+// sandboxed by Clone, or restarting after a snapshot rollback that
+// preserved the .fw file) costs two GETs and performs no writes.
 func (p *pmox) Start(ctx context.Context, vm *VM) error {
 	pVM, err := p.getVM(ctx, vm)
 	if err != nil {
 		return err
 	}
+	if p.cfg.Firewall.Enabled {
+		if err := p.ensureFirewall(ctx, pVM); err != nil {
+			return fmt.Errorf("ensure firewall before start: %w", err)
+		}
+	}
 	return p.startInternal(ctx, pVM)
+}
+
+// ensureFirewall verifies that a VM carries the configured sandbox —
+// security-group rule attached, per-VM firewall options enabled, and
+// firewall=1 on every NIC — and applies whatever is missing. Same
+// ordering contract as applyFirewall: the group rule is inserted
+// before the firewall is enabled so an enabled-with-empty-rules window
+// never exists.
+func (p *pmox) ensureFirewall(ctx context.Context, pVM *proxmox.VirtualMachine) error {
+	rules, err := pVM.FirewallRules(ctx)
+	if err != nil {
+		return fmt.Errorf("list firewall rules on vm %d (node %s): %w", pVM.VMID, pVM.Node, err)
+	}
+	hasGroup := false
+	for _, r := range rules {
+		if r.Type == "group" && r.Action == p.cfg.Firewall.SecurityGroup && r.Enable == 1 {
+			hasGroup = true
+			break
+		}
+	}
+	fwOpts, err := pVM.FirewallOptionGet(ctx)
+	if err != nil {
+		return fmt.Errorf("get firewall options on vm %d (node %s): %w", pVM.VMID, pVM.Node, err)
+	}
+	enabled := fwOpts != nil && bool(fwOpts.Enable)
+	if !hasGroup {
+		rule := &proxmox.FirewallRule{
+			Type:   "group",
+			Action: p.cfg.Firewall.SecurityGroup,
+			Enable: 1,
+		}
+		if err := pVM.NewFirewallRule(ctx, rule); err != nil {
+			return fmt.Errorf("attach security group %q to vm %d (node %s): %w",
+				p.cfg.Firewall.SecurityGroup, pVM.VMID, pVM.Node, err)
+		}
+	}
+	if !enabled {
+		opts := &proxmox.FirewallVirtualMachineOption{
+			Enable: true,
+			Dhcp:   proxmox.IntOrBool(p.cfg.Firewall.DHCPOrDefault()),
+		}
+		if err := pVM.FirewallOptionSet(ctx, opts); err != nil {
+			return fmt.Errorf("enable firewall on vm %d (node %s): %w", pVM.VMID, pVM.Node, err)
+		}
+	}
+	// NIC attachment: rules and options do nothing for a NIC whose net
+	// string lacks firewall=1 (it bypasses the firewall bridge). The
+	// config was fetched by getVM just above, so it reflects current
+	// state; overridden=0 because no profile override is in play here.
+	if patches := nicFirewallPatches(pVM.VirtualMachineConfig, 0); len(patches) > 0 {
+		if _, err := pVM.Config(ctx, patches...); err != nil {
+			return fmt.Errorf("force firewall=1 on NICs of vm %d (node %s): %w", pVM.VMID, pVM.Node, err)
+		}
+	}
+	return nil
 }
 
 func (p *pmox) startInternal(ctx context.Context, pVM *proxmox.VirtualMachine) error {
@@ -1224,7 +1300,8 @@ func encodeNIC(nic CloneNIC, firewallOn bool) string {
 // bridge (fwbr<N>) when the NIC's net string carries firewall=1.
 // Enabling the VM firewall and attaching rules does nothing for a NIC
 // without the flag — traffic flows unfiltered with zero errors
-// anywhere. Clone uses this for template-inherited NICs.
+// anywhere. Clone uses this for template-inherited NICs;
+// ensureFirewall uses it (overridden=0) to re-verify before Start.
 func nicFirewallPatches(cfg *proxmox.VirtualMachineConfig, overridden int) []proxmox.VirtualMachineOption {
 	if cfg == nil || len(cfg.Nets) == 0 {
 		return nil
