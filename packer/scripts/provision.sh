@@ -60,6 +60,31 @@ systemctl enable --now qemu-guest-agent
 log "qemu-guest-agent active"
 
 # -----------------------------------------------------------------------------
+# CI toolchain.
+# -----------------------------------------------------------------------------
+# Baked in because ephemeral runners reset to a clean snapshot after every
+# job — nothing installed at job time survives, so anything workflows need
+# on every run belongs in the image. Docker covers container actions
+# (docker/build-push-action, MegaLinter, …); the rest are the common
+# native-build dependencies (diff-cover needs pip, Flutter needs
+# zip/unzip/libglu, node-gyp needs build-essential). Language toolchains
+# (node, flutter, go, …) are deliberately NOT baked — actions/setup-* and
+# subosito/flutter-action manage their own pinned versions per repo.
+log "installing CI toolchain (docker + build deps)"
+apt-get install -y --no-install-recommends \
+    docker.io \
+    docker-buildx \
+    docker-compose-v2 \
+    build-essential \
+    python3-pip \
+    python3-venv \
+    zip \
+    rsync \
+    git-lfs \
+    libglu1-mesa
+systemctl enable docker.service
+
+# -----------------------------------------------------------------------------
 # Runner user.
 # -----------------------------------------------------------------------------
 log "creating runner user ${RUNNER_USER}"
@@ -74,6 +99,9 @@ passwd -l "${RUNNER_USER}" || true
 install -m 0440 /dev/stdin /etc/sudoers.d/10-runner <<EOF
 ${RUNNER_USER} ALL=(ALL) NOPASSWD: ALL
 EOF
+
+# Container actions and docker build steps run as the runner user.
+usermod -aG docker "${RUNNER_USER}"
 
 # -----------------------------------------------------------------------------
 # GitHub Actions runner binary.
