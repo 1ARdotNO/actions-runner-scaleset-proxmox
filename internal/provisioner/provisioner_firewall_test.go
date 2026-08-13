@@ -127,6 +127,29 @@ func TestClone_FirewallFailureFailsClone(t *testing.T) {
 		"failed clone must put its VMID on reuse cooldown")
 }
 
+func TestDanglingVolumeResource(t *testing.T) {
+	t.Parallel()
+	res, ok := danglingVolumeResource(errors.New(
+		`await delete: proxmox task UPID:... failed: Could not activate resource vm-11000-cloudinit on Thor: API Return-Code: 404`))
+	require.True(t, ok)
+	require.Equal(t, "vm-11000-cloudinit", res)
+
+	_, ok = danglingVolumeResource(errors.New("delete vm: some other failure"))
+	require.False(t, ok)
+	_, ok = danglingVolumeResource(nil)
+	require.False(t, ok)
+}
+
+func TestDiskKeyRe(t *testing.T) {
+	t.Parallel()
+	for _, k := range []string{"scsi0", "ide2", "virtio1", "sata3", "efidisk0", "tpmstate0", "unused0"} {
+		require.True(t, diskKeyRe.MatchString(k), k)
+	}
+	for _, k := range []string{"net0", "name", "lock", "scsihw", "boot", "ide", "memory"} {
+		require.False(t, diskKeyRe.MatchString(k), k)
+	}
+}
+
 func TestIsLockError(t *testing.T) {
 	t.Parallel()
 	cases := []struct {

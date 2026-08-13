@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -1011,6 +1012,59 @@ func (p *pmox) unlockVM(ctx context.Context, pVM *proxmox.VirtualMachine) error 
 	return err
 }
 
+// danglingVolumeRe matches PVE's error when destroying a VM whose disk
+// references a storage volume that no longer exists on the backend
+// (observed with the LINSTOR/DRBD plugin: "Could not activate resource
+// vm-11000-cloudinit on Thor ... Resource definition
+// 'vm-11000-cloudinit' not found"). A cancelled clone task can remove
+// the volume while leaving the reference in the VM config; destroy then
+// fails forever because PVE activates every volume before deleting it,
+// the store row wedges in Destroying, and its capacity slot starves the
+// scale set.
+var danglingVolumeRe = regexp.MustCompile(`Could not activate resource (\S+) on`)
+
+// diskKeyRe matches the VM config keys that carry volume references.
+var diskKeyRe = regexp.MustCompile(`^(scsi|ide|virtio|sata|efidisk|tpmstate|unused)\d+$`)
+
+// danglingVolumeResource extracts the unresolvable storage resource
+// name from a destroy failure, when that is what the error indicates.
+func danglingVolumeResource(err error) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	m := danglingVolumeRe.FindStringSubmatch(err.Error())
+	if m == nil {
+		return "", false
+	}
+	return m[1], true
+}
+
+// detachVolumesReferencing removes every disk entry in the VM's config
+// whose value references the named storage resource so a destroy retry
+// no longer trips over the missing volume.
+func (p *pmox) detachVolumesReferencing(ctx context.Context, vm *VM, pVM *proxmox.VirtualMachine, resource string) error {
+	var cfg map[string]any
+	if err := p.cli.Get(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/config", vm.Node, vm.VMID), &cfg); err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+	var keys []string
+	for k, v := range cfg {
+		s, ok := v.(string)
+		if !ok || !diskKeyRe.MatchString(k) {
+			continue
+		}
+		if strings.Contains(s, resource) {
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) == 0 {
+		return fmt.Errorf("no disk entries reference %q", resource)
+	}
+	sort.Strings(keys)
+	_, err := pVM.Config(ctx, proxmox.VirtualMachineOption{Name: "delete", Value: strings.Join(keys, ",")})
+	return err
+}
+
 func (p *pmox) Destroy(ctx context.Context, vm *VM) error {
 	pVM, err := p.getVM(ctx, vm)
 	if err != nil {
@@ -1052,6 +1106,22 @@ func (p *pmox) Destroy(ctx context.Context, vm *VM) error {
 		if uerr := p.unlockVM(ctx, pVM); uerr == nil {
 			err = deleteOnce()
 		}
+	}
+	// A VM may carry several dangling volume references (each retry
+	// surfaces the next one), so iterate — bounded well above any real
+	// disk count.
+	for attempts := 0; err != nil && attempts < 4; attempts++ {
+		resource, ok := danglingVolumeResource(err)
+		if !ok {
+			break
+		}
+		p.log.Warn("destroy blocked by dangling volume reference; detaching and retrying",
+			"vmid", vm.VMID, "resource", resource)
+		if derr := p.detachVolumesReferencing(ctx, vm, pVM, resource); derr != nil {
+			p.log.Warn("detach dangling volume failed", "vmid", vm.VMID, "resource", resource, "err", derr)
+			break
+		}
+		err = deleteOnce()
 	}
 	if err != nil {
 		// Mid-task 404 → idempotent success (VM disappeared while we
