@@ -453,6 +453,24 @@ type CloneConfig struct {
 	// much faster but pins clones to the template's storage. *bool so
 	// "unset" (apply default) is distinguishable from "explicitly false".
 	Linked *bool `yaml:"linked,omitempty"`
+
+	// MaxConcurrent caps how many qm clone operations may be in flight
+	// at once across ALL scale sets in this process. Full clones are
+	// IO-heavy: an unbounded fan-out (N scale sets × per-tick needs)
+	// piles qmclone tasks onto the template node, starves the per-VM
+	// config locks and wedges the whole fleet (observed in production:
+	// 10 concurrent 16G clones on HDD-backed storage, load 53, zero
+	// VMs able to boot). 0/unset applies the default of 2.
+	MaxConcurrent int `yaml:"max_concurrent,omitempty" validate:"gte=0,lte=64"`
+}
+
+// MaxConcurrentOrDefault returns the configured clone-concurrency cap,
+// defaulting to 2 when unset.
+func (c CloneConfig) MaxConcurrentOrDefault() int {
+	if c.MaxConcurrent <= 0 {
+		return 2
+	}
+	return c.MaxConcurrent
 }
 
 // LinkedOrDefault returns true unless the user explicitly set

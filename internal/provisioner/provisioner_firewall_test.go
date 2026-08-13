@@ -2,7 +2,9 @@ package provisioner
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -116,6 +118,30 @@ func TestClone_FirewallFailureFailsClone(t *testing.T) {
 	got := findVM(t, fp, 10044)
 	require.False(t, got.EverStarted, "firewall failure must abort Clone before Start")
 	require.False(t, got.Running)
+
+	// A failed clone must enter the VMID reuse cooldown so the
+	// allocator advances to a different ID next tick instead of
+	// hammering the same doomed VMID in a loop (production deadlock:
+	// an orphan squatting on the range minimum absorbed every clone).
+	require.True(t, p.IsRecentlyDestroyed(10044, time.Minute),
+		"failed clone must put its VMID on reuse cooldown")
+}
+
+func TestIsLockError(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{errors.New("VM is locked (rollback)"), true},
+		{errors.New("can't lock file '/var/lock/qemu-server/lock-11500.conf' - got timeout"), true},
+		{errors.New("connection refused"), false},
+		{errors.New("some other proxmox error"), false},
+	}
+	for _, c := range cases {
+		require.Equal(t, c.want, isLockError(c.err), "err=%v", c.err)
+	}
 }
 
 // TestClone_FirewallDisabledMakesNoFirewallCalls: with the block absent
