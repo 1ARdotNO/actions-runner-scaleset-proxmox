@@ -181,3 +181,110 @@ func TestBuildCloneConfig_NICOverridePreservesFirewallFlag(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Template-inherited NIC firewall flag (nicFirewallPatches)
+// ---------------------------------------------------------------------------
+//
+// PVE only routes a NIC through the VM firewall bridge when its net
+// string carries firewall=1. A template NIC that no profile override
+// rebuilds is copied verbatim on clone — without patching, a template
+// whose NIC lacks the flag would produce runners with enable=1 and
+// rules attached but zero actual filtering, silently.
+
+func TestForceNICFirewallFlag(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		in      string
+		want    string
+		changed bool
+	}{
+		// No flag → appended, everything else (MAC, bridge) untouched.
+		{"virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0",
+			"virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,firewall=1", true},
+		// Explicit firewall=0 → corrected in place, position kept.
+		{"virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,firewall=0,mtu=9000",
+			"virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,firewall=1,mtu=9000", true},
+		// Already firewall=1 → untouched, reported unchanged.
+		{"virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,tag=42,firewall=1",
+			"virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,tag=42,firewall=1", false},
+		// Exotic attrs survive verbatim.
+		{"e1000=00:11:22:33:44:55,bridge=vmbr1,tag=30,trunks=10;20,queues=4",
+			"e1000=00:11:22:33:44:55,bridge=vmbr1,tag=30,trunks=10;20,queues=4,firewall=1", true},
+	}
+	for _, tc := range cases {
+		got, changed := forceNICFirewallFlag(tc.in)
+		require.Equal(t, tc.want, got, "input %q", tc.in)
+		require.Equal(t, tc.changed, changed, "input %q", tc.in)
+	}
+}
+
+// TestClone_TemplateNICsGetFirewallFlag: with no profile NIC override,
+// the template's net strings are cloned verbatim — the provisioner
+// must patch firewall=1 onto every one of them (preserving MAC, tag,
+// and any other attribute) or the sandbox never engages.
+func TestClone_TemplateNICsGetFirewallFlag(t *testing.T) {
+	t.Parallel()
+	fp := fakeproxmox.New(t, fakeproxmox.Options{})
+	require.NoError(t, fp.SetVMConfig(9000, "net0", "virtio=AA:BB:CC:DD:EE:F0,bridge=vmbr0"))
+	require.NoError(t, fp.SetVMConfig(9000, "net1", "virtio=AA:BB:CC:DD:EE:F1,bridge=vmbr1,tag=30,firewall=0"))
+	p := newFirewallProvisioner(t, fp, config.FirewallConfig{
+		Enabled:       true,
+		SecurityGroup: "gh-runner",
+	})
+
+	vm, err := p.Clone(context.Background(), CloneOptions{
+		NewVMID: 10046, Node: "pve1", Name: "gh-runner-test-10046",
+	})
+	require.NoError(t, err)
+
+	got := findVM(t, fp, vm.VMID)
+	require.Equal(t, "virtio=AA:BB:CC:DD:EE:F0,bridge=vmbr0,firewall=1",
+		got.Config["net0"], "missing flag must be appended, MAC preserved")
+	require.Equal(t, "virtio=AA:BB:CC:DD:EE:F1,bridge=vmbr1,tag=30,firewall=1",
+		got.Config["net1"], "explicit firewall=0 must be corrected, tag preserved")
+}
+
+// TestClone_OverriddenNICNotDoublePatched: a profile override rebuilds
+// net0 via encodeNIC (which appends firewall=1 itself); only the
+// template NICs beyond the override list are patched.
+func TestClone_OverriddenNICNotDoublePatched(t *testing.T) {
+	t.Parallel()
+	fp := fakeproxmox.New(t, fakeproxmox.Options{})
+	require.NoError(t, fp.SetVMConfig(9000, "net0", "virtio=AA:BB:CC:DD:EE:F0,bridge=vmbr0"))
+	require.NoError(t, fp.SetVMConfig(9000, "net1", "virtio=AA:BB:CC:DD:EE:F1,bridge=vmbr1"))
+	p := newFirewallProvisioner(t, fp, config.FirewallConfig{
+		Enabled:       true,
+		SecurityGroup: "gh-runner",
+	})
+
+	vm, err := p.Clone(context.Background(), CloneOptions{
+		NewVMID: 10047, Node: "pve1", Name: "gh-runner-test-10047",
+		NICs: []CloneNIC{{Bridge: "vmbr9", VLANTag: 7}},
+	})
+	require.NoError(t, err)
+
+	got := findVM(t, fp, vm.VMID)
+	require.Equal(t, "virtio,bridge=vmbr9,tag=7,firewall=1", got.Config["net0"],
+		"overridden NIC comes from encodeNIC — exactly one firewall=1, no template leftovers")
+	require.Equal(t, "virtio=AA:BB:CC:DD:EE:F1,bridge=vmbr1,firewall=1", got.Config["net1"],
+		"non-overridden template NIC must still be patched")
+}
+
+// TestClone_FirewallDisabledLeavesTemplateNICsAlone: the disabled path
+// must remain byte-for-byte pre-feature — inherited NIC strings are
+// not rewritten.
+func TestClone_FirewallDisabledLeavesTemplateNICsAlone(t *testing.T) {
+	t.Parallel()
+	fp := fakeproxmox.New(t, fakeproxmox.Options{})
+	require.NoError(t, fp.SetVMConfig(9000, "net0", "virtio=AA:BB:CC:DD:EE:F0,bridge=vmbr0"))
+	p := newTestProvisioner(t, fp.Server, "pve1")
+
+	vm, err := p.Clone(context.Background(), CloneOptions{
+		NewVMID: 10048, Node: "pve1", Name: "gh-runner-test-10048",
+	})
+	require.NoError(t, err)
+
+	got := findVM(t, fp, vm.VMID)
+	require.Equal(t, "virtio=AA:BB:CC:DD:EE:F0,bridge=vmbr0", got.Config["net0"])
+}

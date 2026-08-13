@@ -125,6 +125,24 @@ func (s *Server) SeedVM(node string, vmid int, name string, running bool, tags [
 // fake's state. Tests use it to assert on the orchestrator's effects.
 func (s *Server) Snapshot() []VMSnapshot { return s.store.snapshot() }
 
+// SetVMConfig sets one qemu config key on an existing VM, bypassing
+// the API. Tests use it to give the seeded template a hardware config
+// (e.g. a net0 string) that clones then inherit — mirroring real PVE,
+// where qm clone copies the template's config keys into the new .conf.
+//
+// Returns an error when the VMID is unknown so a typo in a test
+// surfaces immediately rather than silently no-op'ing.
+func (s *Server) SetVMConfig(vmid int, key string, value any) error {
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	v, ok := s.store.findVMLocked(vmid)
+	if !ok {
+		return fmt.Errorf("fakeproxmox: SetVMConfig: vmid %d not found", vmid)
+	}
+	v.Config[key] = value
+	return nil
+}
+
 // PowerOff flips a VM's Running flag to false, bypassing the qm stop
 // HTTP path. Used by e2e scenarios that want to model "the in-VM
 // runner finished and powered itself off" without faking a complete

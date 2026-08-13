@@ -92,6 +92,13 @@ func (s *store) snapshot() []VMSnapshot {
 				fwOpts[k] = val
 			}
 		}
+		var cfgCopy map[string]any
+		if len(v.Config) > 0 {
+			cfgCopy = make(map[string]any, len(v.Config))
+			for k, val := range v.Config {
+				cfgCopy[k] = val
+			}
+		}
 		out = append(out, VMSnapshot{
 			VMID:                       v.VMID,
 			Node:                       v.Node,
@@ -101,6 +108,7 @@ func (s *store) snapshot() []VMSnapshot {
 			Snapshots:                  append([]string(nil), v.Snapshots...),
 			SnapshotCreates:            v.SnapshotCreates,
 			Rollbacks:                  v.Rollbacks,
+			Config:                     cfgCopy,
 			FirewallRules:              append([]FirewallRuleRecord(nil), v.FirewallRules...),
 			FirewallOptions:            fwOpts,
 			EverStarted:                v.EverStarted,
@@ -124,6 +132,11 @@ type VMSnapshot struct {
 	Snapshots       []string
 	SnapshotCreates int
 	Rollbacks       int
+
+	// Config is a copy of the VM's qemu config keys as set via the
+	// config endpoint (or inherited from the template on clone). Nil
+	// when no keys are set. Tests assert on net<N> strings here.
+	Config map[string]any
 
 	// Firewall state as applied via the per-VM firewall endpoints.
 	// FirewallActiveAtFirstStart is only meaningful when EverStarted.
@@ -158,7 +171,8 @@ func (s *store) findVMLocked(vmid int) (*vmRecord, bool) {
 // cloneVM creates a new VM by copying the template, returning a task
 // record the caller can poll. Caller must hold s.mu.
 func (s *store) cloneVMLocked(templateVMID, newVMID int, targetNode, name string) (*vmRecord, *taskRecord, error) {
-	if _, ok := s.vms[templateVMID]; !ok {
+	tpl, ok := s.vms[templateVMID]
+	if !ok {
 		return nil, nil, fmt.Errorf("template vmid %d does not exist", templateVMID)
 	}
 	if _, exists := s.vms[newVMID]; exists {
@@ -167,13 +181,22 @@ func (s *store) cloneVMLocked(templateVMID, newVMID int, targetNode, name string
 	if name == "" {
 		name = fmt.Sprintf("clone-of-%d", templateVMID)
 	}
+	// Mirror real PVE: qm clone copies the template's hardware config
+	// (net<N>, disks, ...) into the new VM's .conf. Per-VM firewall
+	// state (FirewallRules / FirewallOptions) is intentionally NOT
+	// copied — it lives in /etc/pve/firewall/<vmid>.fw, which real
+	// Proxmox does not clone either.
+	cfgCopy := make(map[string]any, len(tpl.Config))
+	for k, val := range tpl.Config {
+		cfgCopy[k] = val
+	}
 	v := &vmRecord{
 		VMID:    newVMID,
 		Node:    targetNode,
 		Name:    name,
 		Tags:    "", // tags are applied by a subsequent PUT /config
 		Running: false,
-		Config:  map[string]any{},
+		Config:  cfgCopy,
 	}
 	s.vms[newVMID] = v
 	return v, s.newTaskLocked(targetNode, "qmclone", fmt.Sprintf("%d", newVMID)), nil

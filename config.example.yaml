@@ -173,6 +173,12 @@ proxmox:
   #     common for clone/config permissions) to manage per-VM firewall
   #     rules and options.
   #
+  # NIC attachment is handled automatically: every runner NIC is forced
+  # to firewall=1 on clone — profile-overridden NICs and NICs inherited
+  # from the template alike — because a NIC without that flag bypasses
+  # the VM firewall entirely even when rules are attached. No
+  # template-side NIC firewall flag is required.
+  #
   # firewall:
   #   enabled: true               # default false — no behavior change when absent
   #   security_group: gh-runner   # required when enabled

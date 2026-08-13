@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -541,6 +542,19 @@ func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
 	configOpts, err := buildCloneConfig(p.scaleSetName, opts, p.cfg.Firewall.Enabled)
 	if err != nil {
 		return nil, err
+	}
+	if p.cfg.Firewall.Enabled {
+		// Profile NIC overrides carry firewall=1 via encodeNIC, but a
+		// template NIC that is NOT overridden is copied verbatim by
+		// the clone — and PVE only routes a NIC through the VM
+		// firewall bridge when its net string carries firewall=1.
+		// With enable=1 and rules in place but no NIC flag, filtering
+		// silently never engages: the exact "looks sandboxed, isn't"
+		// failure this feature exists to prevent. Patch every
+		// inherited net<N> in the same Config call so the flag lands
+		// atomically with the tags/overrides.
+		configOpts = append(configOpts,
+			nicFirewallPatches(newVM.VirtualMachineConfig, len(opts.NICs))...)
 	}
 	if _, err := newVM.Config(ctx, configOpts...); err != nil {
 		return nil, fmt.Errorf("set owner tags / overrides: %w", err)
@@ -1197,4 +1211,61 @@ func encodeNIC(nic CloneNIC, firewallOn bool) string {
 		parts = append(parts, "firewall=1")
 	}
 	return strings.Join(parts, ",")
+}
+
+// nicFirewallPatches returns Config options that force firewall=1 onto
+// every net<N> string in cfg that a profile override did not rebuild
+// (overridden indexes 0..overridden-1 come from encodeNIC, which
+// already appends the flag). Each NIC string is preserved verbatim —
+// model, MAC, bridge, tag, mtu — only the firewall attribute is added
+// or corrected, so a cloned NIC keeps its generated MAC address.
+//
+// Why this exists: PVE only routes a NIC through the VM firewall
+// bridge (fwbr<N>) when the NIC's net string carries firewall=1.
+// Enabling the VM firewall and attaching rules does nothing for a NIC
+// without the flag — traffic flows unfiltered with zero errors
+// anywhere. Clone uses this for template-inherited NICs.
+func nicFirewallPatches(cfg *proxmox.VirtualMachineConfig, overridden int) []proxmox.VirtualMachineOption {
+	if cfg == nil || len(cfg.Nets) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(cfg.Nets))
+	for k := range cfg.Nets {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys) // deterministic option order for tests and logs
+	var out []proxmox.VirtualMachineOption
+	for _, k := range keys {
+		var idx int
+		if _, err := fmt.Sscanf(k, "net%d", &idx); err == nil && idx < overridden {
+			continue // rebuilt by encodeNIC; flag already present
+		}
+		val := cfg.Nets[k]
+		if val == "" {
+			continue
+		}
+		if patched, changed := forceNICFirewallFlag(val); changed {
+			out = append(out, proxmox.VirtualMachineOption{Name: k, Value: patched})
+		}
+	}
+	return out
+}
+
+// forceNICFirewallFlag rewrites one Proxmox net<N> value so it carries
+// firewall=1: an existing firewall=... attribute is corrected in
+// place, otherwise the flag is appended. The second return reports
+// whether the string changed (false means the flag was already set).
+func forceNICFirewallFlag(nic string) (string, bool) {
+	parts := strings.Split(nic, ",")
+	for i, part := range parts {
+		key, val, ok := strings.Cut(part, "=")
+		if ok && strings.TrimSpace(key) == "firewall" {
+			if strings.TrimSpace(val) == "1" {
+				return nic, false
+			}
+			parts[i] = "firewall=1"
+			return strings.Join(parts, ","), true
+		}
+	}
+	return nic + ",firewall=1", true
 }
