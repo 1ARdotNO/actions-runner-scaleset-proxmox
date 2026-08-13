@@ -812,11 +812,17 @@ func runSwallowCancel(fn func() error) error {
 // only as a future-proofing hook.
 func initScalesetStates(ctx context.Context, cfg *config.Config, log *slog.Logger) (map[string]*scalesetState, provisioner.Provisioner, error) {
 	scStates := make(map[string]*scalesetState, len(cfg.Scalesets))
+	// One clone-concurrency semaphore per orchestrator instance, shared
+	// by every scale set's provisioner: the contended resources (template
+	// disk, target storage, per-VM config locks) are cluster-wide, so a
+	// per-scaleset cap would multiply by the number of scale sets.
+	cloneSem := provisioner.NewCloneSemaphore(cfg.Proxmox.Clone.MaxConcurrentOrDefault())
 	for _, s := range cfg.Scalesets {
 		vmPrefix := fmt.Sprintf("gh-runner-%s-", s.Name)
 		prov, err := provisioner.New(ctx, cfg.Proxmox, s.Name, vmPrefix, provisioner.Options{
 			CloneInflightTTL:     cfg.Pool.CloneInflightGrace.D(),
 			RecentlyDestroyedTTL: cfg.Pool.VMIDReuseCooldown.D() * 4,
+			CloneSem:             cloneSem,
 		}, log)
 		if err != nil {
 			return nil, nil, fmt.Errorf("init provisioner for scaleset %q: %w", s.Name, err)

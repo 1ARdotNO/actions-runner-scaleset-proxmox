@@ -246,6 +246,10 @@ type pmox struct {
 	// (typically shorter) cooldown. Set via the constructor from
 	// pool.vmid_reuse_cooldown × 4; zero falls back to a 10m default.
 	recentlyDestroyed *ttlcache.Cache[int, time.Time]
+
+	// cloneSem is the instance-wide clone-concurrency limiter shared by
+	// every scale set's provisioner (see Options.CloneSem). Nil = no cap.
+	cloneSem chan struct{}
 }
 
 // Options configures Provisioner trackers separate from the static
@@ -264,6 +268,46 @@ type Options struct {
 	// comfortably above the longest plausible vmid_reuse_cooldown.
 	// Defaults to 10 minutes.
 	RecentlyDestroyedTTL time.Duration
+
+	// CloneSem bounds concurrent qm clone operations. Build it once per
+	// orchestrator instance with NewCloneSemaphore and pass the SAME
+	// channel to every scale set's provisioner. Nil disables the cap.
+	CloneSem chan struct{}
+}
+
+// NewCloneSemaphore builds the shared clone-concurrency limiter for one
+// orchestrator instance. Every scale set's provisioner must receive the
+// SAME semaphore (via Options.CloneSem): the contended resources —
+// template disk reads, target-storage writes, the node's task workers
+// and per-VM config locks — are shared cluster state, so a per-scaleset
+// cap would still multiply by the number of scale sets. Unbounded clone
+// fan-out is how the production fleet wedged: 10 concurrent 16G full
+// clones on HDD-backed storage, load 53, every per-VM lock timing out.
+// It is deliberately instance-scoped (not a package global) so multiple
+// orchestrator instances in one process — the e2e suite boots many —
+// cannot starve each other's slots.
+func NewCloneSemaphore(maxConcurrent int) chan struct{} {
+	if maxConcurrent <= 0 {
+		maxConcurrent = 2
+	}
+	return make(chan struct{}, maxConcurrent)
+}
+
+// acquireCloneSlot blocks until a clone slot is free (or ctx fires) and
+// returns its release func. A nil semaphore — a pmox constructed
+// without one, as unit tests do — means no cap is enforced; sending on
+// a nil channel would block forever, so it must be special-cased.
+func (p *pmox) acquireCloneSlot(ctx context.Context) (func(), error) {
+	sem := p.cloneSem
+	if sem == nil {
+		return func() {}, nil
+	}
+	select {
+	case sem <- struct{}{}:
+		return func() { <-sem }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // New constructs a Proxmox-backed Provisioner. It performs a one-time
@@ -298,6 +342,7 @@ func New(ctx context.Context, cfg config.ProxmoxConfig, scaleSetName, vmNamePref
 		log:               log,
 		inFlightClones:    newTracker(opts.CloneInflightTTL),
 		recentlyDestroyed: newTracker(opts.RecentlyDestroyedTTL),
+		cloneSem:          opts.CloneSem,
 	}
 	if err := p.discoverTemplateNode(ctx); err != nil {
 		return nil, err
@@ -491,12 +536,32 @@ func isTemplate(vm *proxmox.VirtualMachine) bool {
 // warning that would otherwise fire in the narrow window between PVE's
 // qmclone task returning and the follow-up qmconfig that applies our
 // owner tags. The entry is removed on any return path (success or error).
-func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
+func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (vm *VM, retErr error) {
 	if opts.Linked && opts.Node != p.templateNode {
 		return nil, fmt.Errorf("%w: requested node=%s template_node=%s", ErrLinkedCloneCrossNode, opts.Node, p.templateNode)
 	}
+	// Bound process-wide clone concurrency BEFORE reserving trackers.
+	// Waiting here (rather than erroring) keeps the pool's dispatch
+	// logic oblivious: excess clone requests simply queue.
+	release, err := p.acquireCloneSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	p.inFlightClones.Set(opts.NewVMID, time.Now(), ttlcache.DefaultTTL)
 	defer p.inFlightClones.Delete(opts.NewVMID)
+	// A failed clone leaves its VMID either occupied by a partial VM or
+	// contended by a dying PVE task. The allocator scans the range from
+	// its minimum, so without a cooldown it re-picks the same VMID every
+	// tick and the scale set live-locks on one doomed ID (observed in
+	// production when an orphan squatted on the range minimum). The
+	// reuse cooldown makes the next allocation advance past it while
+	// the orphan sweep cleans up.
+	defer func() {
+		if retErr != nil {
+			p.recentlyDestroyed.Set(opts.NewVMID, time.Now(), ttlcache.DefaultTTL)
+		}
+	}()
 
 	templateVMID := resolveTemplateVMID(opts.TemplateVMID, p.cfg.TemplateVMID)
 	templateNodeName, err := p.resolveTemplateNode(ctx, opts)
@@ -921,6 +986,31 @@ func (p *pmox) stopInternal(ctx context.Context, pVM *proxmox.VirtualMachine) er
 
 // Destroy stops (if needed) and deletes a VM. Idempotent: a missing VM is
 // treated as success.
+// isLockError reports whether a Proxmox failure indicates the VM's
+// config lock is held — either a persistent `lock:` key left behind by
+// a crashed operation (an interrupted snapshot rollback leaves
+// `lock: rollback`, blocking every subsequent qmstop/qmdestroy), or
+// flock contention on /var/lock/qemu-server/lock-<id>.conf. Matched
+// narrowly on the two substrings PVE emits for exactly those cases so
+// unrelated failures never trigger an unlock.
+func isLockError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "is locked") || strings.Contains(s, "can't lock file")
+}
+
+// unlockVM clears a stale config lock — the API equivalent of
+// `qm unlock`. Only ever called from paths whose terminal decision
+// (destroy, or rollback-with-destroy-fallback) is already made: the
+// lock being cleared can only belong to one of OUR OWN crashed
+// operations, because runner VMs are exclusively orchestrator-owned.
+func (p *pmox) unlockVM(ctx context.Context, pVM *proxmox.VirtualMachine) error {
+	_, err := pVM.Config(ctx, proxmox.VirtualMachineOption{Name: "delete", Value: "lock"})
+	return err
+}
+
 func (p *pmox) Destroy(ctx context.Context, vm *VM) error {
 	pVM, err := p.getVM(ctx, vm)
 	if err != nil {
@@ -932,24 +1022,45 @@ func (p *pmox) Destroy(ctx context.Context, vm *VM) error {
 	// Reuse the resolved handle for the stop step — Destroy is on the
 	// hot drain path so an extra round trip per VM matters at scale.
 	if err := p.stopInternal(ctx, pVM); err != nil {
-		p.log.Warn("stop before destroy failed; proceeding to delete anyway", "vmid", vm.VMID, "err", err)
-	}
-	task, err := pVM.Delete(ctx)
-	if err != nil {
-		if isNotFound(err) {
-			return nil
+		if isLockError(err) {
+			// A stale lock (e.g. `lock: rollback` from an interrupted
+			// snapshot rollback) would otherwise wedge the orphan sweep
+			// in an endless destroy-retry loop. The destroy decision is
+			// final — clear it and try the stop once more.
+			p.log.Warn("stop blocked by stale lock; unlocking and retrying", "vmid", vm.VMID)
+			if uerr := p.unlockVM(ctx, pVM); uerr == nil {
+				err = p.stopInternal(ctx, pVM)
+			}
 		}
-		return fmt.Errorf("delete vm: %w", classifyProxmoxError(err))
+		if err != nil {
+			p.log.Warn("stop before destroy failed; proceeding to delete anyway", "vmid", vm.VMID, "err", err)
+		}
 	}
-	if err := awaitTask(ctx, task, 120); err != nil {
+	deleteOnce := func() error {
+		task, derr := pVM.Delete(ctx)
+		if derr != nil {
+			return fmt.Errorf("delete vm: %w", classifyProxmoxError(derr))
+		}
+		if derr := awaitTask(ctx, task, 120); derr != nil {
+			return fmt.Errorf("await delete: %w", classifyProxmoxError(derr))
+		}
+		return nil
+	}
+	err = deleteOnce()
+	if err != nil && isLockError(err) {
+		p.log.Warn("destroy blocked by stale lock; unlocking and retrying", "vmid", vm.VMID)
+		if uerr := p.unlockVM(ctx, pVM); uerr == nil {
+			err = deleteOnce()
+		}
+	}
+	if err != nil {
 		// Mid-task 404 → idempotent success (VM disappeared while we
 		// were tearing it down — common with another orchestrator).
-		classified := classifyProxmoxError(err)
-		if errors.Is(classified, ErrVMNotFound) {
+		if errors.Is(err, ErrVMNotFound) {
 			p.recentlyDestroyed.Set(vm.VMID, time.Now(), ttlcache.DefaultTTL)
 			return nil
 		}
-		return fmt.Errorf("await delete: %w", classified)
+		return err
 	}
 	// PVE has finished the qmdestroy task. Record the timestamp so the
 	// pool's allocateVMID skips this VMID until the configured cooldown
@@ -988,14 +1099,29 @@ func (p *pmox) SnapshotRollback(ctx context.Context, vm *VM, name string) error 
 	if err != nil {
 		return classifyProxmoxError(err)
 	}
-	task, err := pVM.Snapshot(name).Rollback(ctx)
-	if err != nil {
-		return fmt.Errorf("rollback to snapshot %q on vm %d (node %s): %w", name, vm.VMID, vm.Node, classifyProxmoxError(err))
+	rollbackOnce := func() error {
+		task, rerr := pVM.Snapshot(name).Rollback(ctx)
+		if rerr != nil {
+			return fmt.Errorf("rollback to snapshot %q on vm %d (node %s): %w", name, vm.VMID, vm.Node, classifyProxmoxError(rerr))
+		}
+		if rerr := awaitTask(ctx, task, 600); rerr != nil {
+			return fmt.Errorf("await rollback to snapshot %q on vm %d (node %s): %w", name, vm.VMID, vm.Node, classifyProxmoxError(rerr))
+		}
+		return nil
 	}
-	if err := awaitTask(ctx, task, 600); err != nil {
-		return fmt.Errorf("await rollback to snapshot %q on vm %d (node %s): %w", name, vm.VMID, vm.Node, classifyProxmoxError(err))
+	err = rollbackOnce()
+	if err != nil && isLockError(err) {
+		// A crashed previous rollback leaves `lock: rollback` behind,
+		// which blocks the retry that adoption queues after restart.
+		// The caller's contract is rollback-or-destroy-fallback, so the
+		// terminal decision is made — clear our own stale lock and try
+		// once more before surrendering to the destroy fallback.
+		p.log.Warn("rollback blocked by stale lock; unlocking and retrying", "vmid", vm.VMID, "snapshot", name)
+		if uerr := p.unlockVM(ctx, pVM); uerr == nil {
+			err = rollbackOnce()
+		}
 	}
-	return nil
+	return err
 }
 
 // PowerState returns the Proxmox status string ("running"/"stopped"/...)

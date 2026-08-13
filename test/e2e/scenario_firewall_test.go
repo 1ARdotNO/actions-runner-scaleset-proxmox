@@ -38,6 +38,24 @@ func TestE2E_FirewallAppliedToEveryClone(t *testing.T) {
 	}, 15*time.Second, 200*time.Millisecond,
 		"pool never converged to hot=2 warm=1")
 
+	// A snapshot can catch a clone in the short window between the fake
+	// registering the VM (qmclone POST) and the provisioner's firewall
+	// calls landing — that VM has never started, so no invariant is
+	// violated yet. Wait for the fleet to converge (every in-range VM
+	// carries rules) before asserting the details.
+	require.Eventually(t, func() bool {
+		for _, vm := range h.Proxmox.Snapshot() {
+			if vm.VMID < 10000 || vm.VMID > 10999 {
+				continue
+			}
+			if len(vm.FirewallRules) == 0 {
+				return false // mid-provision; rules land or the VM is destroyed
+			}
+		}
+		return true
+	}, 10*time.Second, 200*time.Millisecond,
+		"a clone finished provisioning without firewall rules")
+
 	clones := 0
 	booted := 0
 	for _, vm := range h.Proxmox.Snapshot() {
