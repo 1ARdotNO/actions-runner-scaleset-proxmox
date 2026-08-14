@@ -1739,7 +1739,7 @@ func TestAcquire_OldestHotFirst(t *testing.T) {
 func TestReconcile_StuckProvisioningSweptToDestroying(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
-	stale := time.Now().Add(-10 * time.Minute) // well past the 5-minute grace
+	stale := time.Now().Add(-20 * time.Minute) // well past the 15-minute provisioning grace
 	require.NoError(t, st.Insert(&store.VM{
 		VMID: 12100, Node: "pve1", Name: "stuck",
 		PoolKind: store.PoolKindHot, State: store.StateProvisioning,
@@ -3607,7 +3607,7 @@ func TestAdopt_SnapshotRollbackDeregistersStaleRunner(t *testing.T) {
 func TestSweepStuckRows_RecyclingRowSelfHealsToDestroy(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
-	old := time.Now().Add(-10 * time.Minute) // well past the 5m stuck grace
+	old := time.Now().Add(-20 * time.Minute) // well past the 15m recycling stuck grace
 	require.NoError(t, st.Insert(&store.VM{
 		VMID: 21010, Node: "pve1", Name: "gh-runner-test-21010",
 		Profile: defaultProfileName, PoolKind: store.PoolKindHot,

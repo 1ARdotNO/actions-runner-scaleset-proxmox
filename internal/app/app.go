@@ -697,6 +697,7 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 		LinkedClones:         cfg.Proxmox.Clone.LinkedOrDefault(),
 		TemplateNode:         state.prov.TemplateNode(),
 		VMIDReuseCooldown:    cfg.Pool.VMIDReuseCooldown.D(),
+		CloneInflightGrace:   cfg.Pool.CloneInflightGrace.D(),
 		OnRunnerOrphaned:     ghClient.RemoveRunner,
 		RunnerLister:         gh.NewRunnerLister(restCli, scope, state.vmPrefix, log),
 	}, st, state.prov, sel, log, metrics)

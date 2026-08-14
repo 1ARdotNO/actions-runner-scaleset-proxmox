@@ -141,6 +141,13 @@ type Config struct {
 	TemplateNode string // returned by Provisioner.TemplateNode()
 	GuestAgentTO time.Duration
 
+	// CloneInflightGrace is the operator's statement of the worst-case
+	// clone duration (mirrors pool.clone_inflight_grace). The stuck-row
+	// sweep derives the Provisioning grace from it — judging a clone
+	// "stuck" on any shorter clock manufactures a clone loop (see
+	// sweepStuckRows).
+	CloneInflightGrace time.Duration
+
 	// VMIDReuseCooldown gates how soon after a destroy completes the
 	// allocator may reissue the same VMID. allocateVMID consults
 	// Provisioner.IsRecentlyDestroyed with this duration to skip
@@ -1785,8 +1792,28 @@ func (m *manager) recycleOldVMs(profile string, maxAge time.Duration) {
 // Recycling is included so a wedged snapshot rollback self-heals into
 // the destroy path instead of pinning the row (and its VMID) forever.
 func (m *manager) sweepStuckRows() {
-	const stuckGrace = 5 * time.Minute
-	stuckCutoff := time.Now().Add(-stuckGrace)
+	// Per-state graces. "Stuck" is only meaningful relative to how long
+	// the state legitimately lasts on the deployment's storage: a full
+	// clone on slow replicated storage runs 10-30+ minutes, and a
+	// hardcoded 5m Provisioning grace manufactured an endless clone
+	// loop in production — the sweep killed rows mid-clone, the pool
+	// dispatched replacements, the finished clones became rowless
+	// orphans and were destroyed, forever (fleet ballooned to 53 VMs
+	// against a design max of 11). Provisioning is therefore graced by
+	// the operator's own clone worst case (clone_inflight_grace) plus
+	// margin; Draining/Destroying keep a short grace on purpose — their
+	// sweep merely re-queues the destroy.
+	provGrace := m.cfg.CloneInflightGrace + 5*time.Minute
+	if provGrace < 15*time.Minute {
+		provGrace = 15 * time.Minute
+	}
+	graces := map[store.State]time.Duration{
+		store.StateProvisioning: provGrace,
+		store.StateBooting:      15 * time.Minute,
+		store.StateRecycling:    15 * time.Minute,
+		store.StateDraining:     10 * time.Minute,
+		store.StateDestroying:   10 * time.Minute,
+	}
 	stuckCandidates, err := m.store.ListByState(
 		store.StateProvisioning, store.StateBooting,
 		store.StateRecycling,
@@ -1796,7 +1823,7 @@ func (m *manager) sweepStuckRows() {
 		return
 	}
 	for _, s := range stuckCandidates {
-		if !s.UpdatedAt.Before(stuckCutoff) {
+		if !s.UpdatedAt.Before(time.Now().Add(-graces[s.State])) {
 			continue
 		}
 		m.log.Warn("sweep: row stuck in transient state; re-queueing for destroy",
