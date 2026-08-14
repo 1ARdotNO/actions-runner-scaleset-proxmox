@@ -148,6 +148,20 @@ systemctl daemon-reload
 systemctl enable gh-runner.path
 
 # -----------------------------------------------------------------------------
+# Stateless UEFI boot.
+# -----------------------------------------------------------------------------
+# Ephemeral clones may run without a per-VM efidisk (volatile NVRAM).
+# Ubuntu's removable path ships shim + fallback (fbx64.efi): with
+# volatile NVRAM the fallback writes a boot entry and resets forever.
+# Ship grub next to shim and drop the fallback so every boot is
+# shim -> grub -> OS with zero NVRAM state.
+log "making UEFI boot stateless (removable path: shim -> grub)"
+if [ -d /boot/efi/EFI/BOOT ]; then
+    cp /boot/efi/EFI/ubuntu/grubx64.efi /boot/efi/EFI/BOOT/grubx64.efi
+    rm -f /boot/efi/EFI/BOOT/fbx64.efi
+fi
+
+# -----------------------------------------------------------------------------
 # Kernel hardening.
 # -----------------------------------------------------------------------------
 log "installing sysctl hardening"
