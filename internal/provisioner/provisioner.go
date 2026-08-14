@@ -1401,6 +1401,13 @@ func awaitTask(ctx context.Context, t *proxmox.Task, seconds int) error {
 	if err := t.WaitFor(ctx, seconds); err != nil {
 		return err
 	}
+	// PVE reports non-fatal issues as exit status "WARNINGS: N" — the
+	// task SUCCEEDED (e.g. qmstart of a UEFI VM without an efidisk
+	// warns about the volatile vars store but boots fine). Treating
+	// warnings as failure made the pool destroy perfectly healthy VMs.
+	if strings.HasPrefix(t.ExitStatus, "WARNINGS: ") {
+		return nil
+	}
 	if t.IsFailed || (t.ExitStatus != "" && t.ExitStatus != "OK") {
 		status := t.ExitStatus
 		if status == "" {
