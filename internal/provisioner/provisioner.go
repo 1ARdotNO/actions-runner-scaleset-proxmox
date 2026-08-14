@@ -583,7 +583,12 @@ func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (vm *VM, retErr err
 	if err != nil {
 		return nil, fmt.Errorf("issue clone: %w", err)
 	}
-	if err := awaitTask(ctx, task, 600); err != nil {
+	// 1800s: a full clone is (cfs storage-lock queueing) + (disk copy at
+	// whatever the storage backend sustains). On HDD-backed replicated
+	// storage under load, 16G legitimately takes >10 min; a 600s budget
+	// made the orchestrator abandon clones that were about to succeed,
+	// leaving untagged VMs for the orphan sweep and re-cloning forever.
+	if err := awaitTask(ctx, task, 1800); err != nil {
 		// Abandoning a clone without cancelling it leaves the qmclone
 		// task running on PVE: our semaphore slot frees, the pool
 		// dispatches a replacement, and the abandoned tasks convoy on
