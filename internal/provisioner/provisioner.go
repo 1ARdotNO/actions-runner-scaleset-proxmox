@@ -584,6 +584,17 @@ func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (vm *VM, retErr err
 		return nil, fmt.Errorf("issue clone: %w", err)
 	}
 	if err := awaitTask(ctx, task, 600); err != nil {
+		// Abandoning a clone without cancelling it leaves the qmclone
+		// task running on PVE: our semaphore slot frees, the pool
+		// dispatches a replacement, and the abandoned tasks convoy on
+		// the storage lock until the node melts (observed in
+		// production: 17 orphaned concurrent clones, load 65). Stop is
+		// best-effort on a fresh context — ours may already be done.
+		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		if serr := task.Stop(stopCtx); serr != nil {
+			p.log.Warn("cancel abandoned clone task failed", "vmid", opts.NewVMID, "err", serr)
+		}
+		cancel()
 		return nil, fmt.Errorf("await clone task: %w", err)
 	}
 
